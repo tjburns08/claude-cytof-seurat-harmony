@@ -53,13 +53,13 @@ The pre-Harmony UMAP shows clear segregation by center. Several regions of the U
 knitr::include_graphics("output/pre_harmony_knn_entropy_umap.png")
 ```
 
-The entropy map makes the batch effect immediately visible. Dark regions (low entropy) correspond to neighborhoods where cells are surrounded primarily by cells from the same center. Bright regions (high entropy) indicate well-mixed neighborhoods. Large swaths of the UMAP are dark, confirming substantial batch effects.
+The entropy map makes the batch effect immediately visible. Dark regions (low entropy) correspond to neighborhoods where cells are surrounded primarily by cells from the same center. Bright regions (high entropy) indicate well-mixed neighborhoods. Large swaths of the UMAP are dark, confirming the presence of batch effects.
 
 **Pre-Harmony per-cell KNN entropy: mean = 1.51, SD = 0.73 (max possible = 2.58)**
 
 # Harmony Batch Correction
 
-Harmony was applied to the 19-dimensional marker space, correcting for center identity. Harmony converged in 3 iterations. After correction, the KNN graph, clustering, and UMAP were all re-computed on the Harmony-corrected embeddings.
+Harmony was applied to the 19-dimensional marker space, correcting for center identity. After correction, the KNN graph, clustering, and UMAP were all re-computed on the Harmony-corrected embeddings.
 
 # Post-Harmony Results
 
@@ -69,15 +69,14 @@ Harmony was applied to the 19-dimensional marker space, correcting for center id
 knitr::include_graphics("output/post_harmony_center.png")
 ```
 
-After Harmony, centers are much better mixed across the UMAP. The Center 4-specific regions have been integrated.
+After Harmony, centers are much better mixed across the UMAP. 
 
 ## UMAP Colored by KNN Neighborhood Entropy
 
 ```{r post-entropy, fig.width=10, fig.height=6}
 knitr::include_graphics("output/post_harmony_knn_entropy_umap.png")
 ```
-
-The post-Harmony entropy map is dramatically brighter. Most cells now have high-entropy neighborhoods, indicating good mixing.
+The post-Harmony entropy map is brighter. Most cells now have higher-entropy neighborhoods, indicating better mixing.
 
 **Post-Harmony per-cell KNN entropy: mean = 1.83, SD = 0.49 (max possible = 2.58)**
 
@@ -95,7 +94,7 @@ knitr::include_graphics("output/knn_entropy_umap_comparison.png")
 knitr::include_graphics("output/knn_entropy_histogram.png")
 ```
 
-The histogram clearly shows the shift: pre-Harmony (red) has a broad distribution extending to very low entropies, while post-Harmony (green) is concentrated at higher entropies. The dashed line marks the theoretical maximum for perfect mixing.
+The histogram shows the shift: pre-Harmony (red) has a broad distribution extending to very low entropies, while post-Harmony (green) is concentrated at higher entropies. The dashed line marks the theoretical maximum for perfect mixing.
 
 ## Mean KNN Entropy (Bar Plot)
 
@@ -132,9 +131,9 @@ knitr::include_graphics("output/harmony_comparison.png")
 
 ## Can we detect batch effects in CyTOF data within Seurat?
 
-**Yes.** The KNN neighborhood entropy approach provides a clear, quantitative, and spatially-resolved view of batch effects. By leveraging Seurat's `FindNeighbors` graph and computing Shannon entropy per cell, we can:
+**Yes.** The KNN neighborhood entropy approach provides a intuitive, quantitative, and spatially-resolved view of batch effects. By leveraging Seurat's `FindNeighbors` graph and computing Shannon entropy per cell, we can:
 
-- Visualize exactly where batch effects are concentrated on the UMAP
+- Visualize where batch effects are concentrated on the UMAP
 - Summarize the overall mixing quality as a single number
 - Compare distributions before and after correction
 
@@ -148,21 +147,21 @@ This is more informative than simple visual inspection of color-coded UMAPs, as 
 2. **Per-cluster entropy** increased from 2.19 to 2.51 (out of max 2.58), eliminating the most severely batch-dominated clusters
 3. **Visual assessment** shows noticeably improved mixing on the UMAP and entropy maps
 
-The improvement is real but modest. A mean entropy of 1.83 out of 2.58 means the average cell's neighborhood is still not well-mixed. Whether this level of correction is sufficient depends on the downstream application.
+The improvement is real but modest. A mean entropy of 1.83 out of 2.58 means the average cell's neighborhood is still not well-mixed. Whether this level of correction is sufficient depends on the downstream application. There could potentially be further improvement if integration is done across more conditions than just the 6 centers.
 
 ## Caveats and open questions
 
-1. **Biological signal preservation was not assessed.** This is the most important limitation. The dataset contains 3 conditions (A, B, P) nested within the 6 centers. Harmony was told to correct for center, but we did not verify whether condition-level biological differences survived the correction. In a production analysis, this would need to be checked before proceeding.
+1. **Biological signal preservation was not assessed.** This is the most important limitation. The dataset contains 3 conditions (A: site-stained subaliquot 1, B: site-stained subaliquot 2, P: pre-stained), plus Day 1 and Day 2, nested within the 6 centers. Harmony was told to correct for center, but we did not verify whether additional condition-level biological differences survived the correction. In a production analysis, this would need to be examined before proceeding.
 
 2. **Not perfect mixing**: The post-Harmony mean entropy (1.83) is still well below the theoretical maximum (2.58). Some residual separation may reflect genuine biological differences between centers (different patient populations, sample handling). Complete mixing may not be the goal -- we want to remove technical variation while preserving biology -- but we did not disentangle the two here.
 
-3. **UMAP and entropy were computed on different cell sets**: UMAP was computed on a 10,000-cell subset, while the entropy metrics were computed on all 72,000 cells using the full KNN graph. The UMAP visualizations and the entropy summary statistics do not correspond to the same cells.
+3. **UMAP and entropy were computed on different cell sets**: UMAP was computed on a 10,000-cell subset, while the entropy metrics were computed on all 72,000 cells using the full KNN graph. The UMAP visualizations and the entropy summary statistics do not correspond to the same cells, though it suffices for the sake of visualization.
 
 4. **Seurat adaptation required**: CyTOF analysis in Seurat requires bypassing the standard scRNA-seq pipeline (no normalization, no PCA) and treating the marker space directly as the embedding. This works, but it is not the intended use case for either Seurat or Harmony. Harmony can also be run directly on a matrix via `HarmonyMatrix()`, which would avoid the Seurat workarounds entirely.
 
 # Conclusion
 
-Batch effects in multi-center CyTOF data can be detected using KNN neighborhood entropy and partially corrected using Harmony, all within the Seurat ecosystem. The KNN entropy approach provides clear, quantitative evidence of batch effects. Harmony reduced batch-dominated neighborhoods and improved cross-center mixing, though the correction was incomplete and biological signal preservation was not verified. A production workflow would need to address both of these gaps -- and would likely benefit from using `HarmonyMatrix()` directly rather than routing through Seurat's scRNA-seq-oriented pipeline.
+Batch effects in multi-center CyTOF data can be detected using KNN neighborhood entropy and partially corrected using Harmony, all within the Seurat ecosystem. The kNN entropy approach provides intuitive, quantitative and visual evidence of batch effects. Harmony reduced batch-dominated neighborhoods and improved cross-center mixing, though the correction was incomplete and biological signal preservation was not verified. A production workflow would need to address both of these gaps and would likely benefit from using `HarmonyMatrix()` directly rather than routing through Seurat's scRNA-seq-oriented pipeline.
 
 ```{r session}
 sessionInfo()
