@@ -1,0 +1,350 @@
+---
+title: "CyTOF Batch Correction with Harmony in Seurat"
+author: "Tyler Burns and Claude Code + Opus 4.6"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 7)
+set.seed(42)
+```
+
+# Overview
+
+This analysis reads multi-center CyTOF FCS files, performs asinh transformation, loads them into Seurat, assesses batch effects using KNN neighborhood entropy, applies Harmony correction, and evaluates the improvement.
+
+# 1. Load Libraries
+
+```{r libraries}
+library(flowCore)
+library(Seurat)
+library(harmony)
+library(ggplot2)
+library(patchwork)
+```
+
+# 2. Helper Functions
+
+```{r helpers}
+shannon_entropy <- function(x) {
+  p <- x / sum(x)
+  p <- p[p > 0]
+  -sum(p * log2(p))
+}
+
+compute_knn_entropy <- function(seurat_obj, nn_name = "CyTOF_nn", meta_col = "center") {
+  nn_idx <- seurat_obj@graphs[[nn_name]]
+  centers <- seurat_obj@meta.data[[meta_col]]
+  n_cells <- length(centers)
+  cell_entropy <- numeric(n_cells)
+  for (i in seq_len(n_cells)) {
+    neighbors_i <- nn_idx[i, ]
+    neighbor_idx <- which(neighbors_i > 0)
+    neighbor_centers <- centers[neighbor_idx]
+    center_counts <- table(factor(neighbor_centers, levels = unique(centers)))
+    cell_entropy[i] <- shannon_entropy(center_counts)
+  }
+  return(cell_entropy)
+}
+```
+
+# 3. Read and Transform FCS Files
+
+```{r read-fcs}
+data_dir <- "data"
+output_dir <- "output"
+fcs_files <- list.files(data_dir, pattern = "\\.fcs$", full.names = TRUE)
+cat("Found", length(fcs_files), "FCS files\n")
+
+ff_example <- read.FCS(fcs_files[1], truncate_max_range = FALSE)
+params <- pData(parameters(ff_example))
+
+exclude_desc <- c("beads1", "beads2", "beads3", "beads4", "beads5",
+                   "cells1", "cells2", "livedead", "Event #", "Event_length", "Time")
+type_marker_idx <- which(!params$desc %in% exclude_desc)
+type_marker_names <- params$desc[type_marker_idx]
+
+cat("Type markers (", length(type_marker_names), "):", paste(type_marker_names, collapse = ", "), "\n")
+```
+
+```{r read-all-files}
+all_data <- list()
+all_meta <- list()
+
+for (f in fcs_files) {
+  ff <- read.FCS(f, truncate_max_range = FALSE)
+  mat <- exprs(ff)
+  fname <- basename(f)
+  parts <- strsplit(fname, "_")[[1]]
+  center <- paste(parts[1], parts[2], sep = "_")
+  sample_id <- paste(parts[1], parts[2], parts[3], parts[4], sep = "_")
+  mat_transformed <- asinh(mat / 5)
+  n_cells <- nrow(mat_transformed)
+  if (n_cells > 2000) {
+    idx <- sample(n_cells, 2000)
+    mat_transformed <- mat_transformed[idx, , drop = FALSE]
+  }
+  colnames(mat_transformed) <- params$desc
+  mat_type <- mat_transformed[, type_marker_names, drop = FALSE]
+  meta <- data.frame(center = rep(center, nrow(mat_type)),
+                     sample_id = rep(sample_id, nrow(mat_type)),
+                     stringsAsFactors = FALSE)
+  all_data[[f]] <- mat_type
+  all_meta[[f]] <- meta
+}
+
+combined_data <- do.call(rbind, all_data)
+combined_meta <- do.call(rbind, all_meta)
+rownames(combined_data) <- paste0("cell_", seq_len(nrow(combined_data)))
+rownames(combined_meta) <- rownames(combined_data)
+
+cat("Combined:", nrow(combined_data), "cells x", ncol(combined_data), "markers\n")
+```
+
+# 4. Create Seurat Object
+
+No normalization, no scaling, no PCA -- this is CyTOF data with only 19 markers.
+
+```{r create-seurat}
+seurat_obj <- CreateSeuratObject(counts = t(combined_data), meta.data = combined_meta, assay = "CyTOF")
+LayerData(seurat_obj, assay = "CyTOF", layer = "data") <- LayerData(seurat_obj, assay = "CyTOF", layer = "counts")
+
+marker_matrix <- t(as.matrix(GetAssayData(seurat_obj, layer = "data")))
+colnames(marker_matrix) <- paste0("marker_", seq_len(ncol(marker_matrix)))
+seurat_obj[["markers"]] <- CreateDimReducObject(embeddings = marker_matrix, key = "marker_", assay = "CyTOF")
+
+# Select UMAP subset
+umap_cells <- sample(colnames(seurat_obj), 10000)
+max_entropy <- log2(length(unique(seurat_obj$center)))
+```
+
+# 5. Pre-Harmony: Clustering, UMAP, and Batch Assessment
+
+```{r pre-harmony-cluster}
+seurat_obj <- FindNeighbors(seurat_obj, reduction = "markers", dims = 1:ncol(marker_matrix))
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.8)
+seurat_obj$clusters_pre <- Idents(seurat_obj)
+```
+
+```{r pre-harmony-umap}
+seurat_sub_pre <- subset(seurat_obj, cells = umap_cells)
+seurat_sub_pre <- RunUMAP(seurat_sub_pre, reduction = "markers",
+                          dims = 1:ncol(marker_matrix),
+                          reduction.name = "umap_pre", reduction.key = "UMAPpre_")
+```
+
+## Pre-Harmony UMAPs
+
+```{r pre-harmony-plots, fig.width=14, fig.height=5}
+p_pre_center <- DimPlot(seurat_sub_pre, reduction = "umap_pre", group.by = "center") +
+  ggtitle("Pre-Harmony: Center")
+p_pre_sample <- DimPlot(seurat_sub_pre, reduction = "umap_pre", group.by = "sample_id") +
+  ggtitle("Pre-Harmony: Sample ID") + theme(legend.text = element_text(size = 5))
+p_pre_cluster <- DimPlot(seurat_sub_pre, reduction = "umap_pre", group.by = "seurat_clusters") +
+  ggtitle("Pre-Harmony: Clusters")
+p_pre_center | p_pre_sample | p_pre_cluster
+```
+
+## Pre-Harmony: KNN Neighborhood Entropy
+
+For each cell, we look at its k-nearest neighbors (from `FindNeighbors`), tally up the center labels, and compute Shannon entropy. A well-mixed neighborhood will have high entropy (max = `r round(max_entropy, 2)` for 6 centers). A batch-dominated neighborhood will have low entropy.
+
+```{r pre-knn-entropy}
+knn_entropy_pre <- compute_knn_entropy(seurat_obj, nn_name = "CyTOF_nn", meta_col = "center")
+seurat_obj$knn_entropy_pre <- knn_entropy_pre
+seurat_sub_pre$knn_entropy_pre <- seurat_obj$knn_entropy_pre[umap_cells]
+
+cat("Pre-Harmony per-cell KNN entropy:\n")
+cat("  Mean:", round(mean(knn_entropy_pre), 4), "\n")
+cat("  Median:", round(median(knn_entropy_pre), 4), "\n")
+cat("  SD:", round(sd(knn_entropy_pre), 4), "\n")
+```
+
+```{r pre-entropy-umap, fig.width=8, fig.height=6}
+umap_pre_coords <- Embeddings(seurat_sub_pre, "umap_pre")
+entropy_df_pre <- data.frame(UMAP_1 = umap_pre_coords[, 1], UMAP_2 = umap_pre_coords[, 2],
+                              knn_entropy = seurat_sub_pre$knn_entropy_pre)
+p_pre_entropy_umap <- ggplot(entropy_df_pre, aes(x = UMAP_1, y = UMAP_2, color = knn_entropy)) +
+  geom_point(size = 0.3) +
+  scale_color_viridis_c(limits = c(0, max_entropy), option = "inferno") +
+  theme_minimal() + ggtitle("Pre-Harmony: KNN Neighborhood Entropy") + labs(color = "Entropy")
+p_pre_entropy_umap
+```
+
+## Pre-Harmony: Per-Cluster Entropy
+
+```{r pre-cluster-entropy}
+cluster_center_table_pre <- table(seurat_obj$clusters_pre, seurat_obj$center)
+cluster_entropies_pre <- apply(cluster_center_table_pre, 1, shannon_entropy)
+cat("Mean cluster entropy:", round(mean(cluster_entropies_pre), 3), "/", round(max_entropy, 3), "\n")
+```
+
+# 6. Harmony Batch Correction
+
+```{r run-harmony}
+seurat_obj <- RunHarmony(seurat_obj, group.by.vars = "center", reduction = "markers",
+                         reduction.save = "harmony", assay.use = "CyTOF", project.dim = FALSE)
+```
+
+# 7. Post-Harmony: Re-run Clustering, UMAP, and Batch Assessment
+
+```{r post-harmony-cluster}
+n_harmony_dims <- ncol(Embeddings(seurat_obj, "harmony"))
+seurat_obj <- FindNeighbors(seurat_obj, reduction = "harmony", dims = 1:n_harmony_dims)
+seurat_obj <- FindClusters(seurat_obj, resolution = 0.8)
+seurat_obj$clusters_post <- Idents(seurat_obj)
+```
+
+```{r post-harmony-umap}
+seurat_sub_post <- subset(seurat_obj, cells = umap_cells)
+seurat_sub_post <- RunUMAP(seurat_sub_post, reduction = "harmony", dims = 1:n_harmony_dims,
+                           reduction.name = "umap_post", reduction.key = "UMAPpost_")
+```
+
+## Post-Harmony UMAPs
+
+```{r post-harmony-plots, fig.width=14, fig.height=5}
+p_post_center <- DimPlot(seurat_sub_post, reduction = "umap_post", group.by = "center") +
+  ggtitle("Post-Harmony: Center")
+p_post_sample <- DimPlot(seurat_sub_post, reduction = "umap_post", group.by = "sample_id") +
+  ggtitle("Post-Harmony: Sample ID") + theme(legend.text = element_text(size = 5))
+p_post_cluster <- DimPlot(seurat_sub_post, reduction = "umap_post", group.by = "seurat_clusters") +
+  ggtitle("Post-Harmony: Clusters")
+p_post_center | p_post_sample | p_post_cluster
+```
+
+## Post-Harmony: KNN Neighborhood Entropy
+
+```{r post-knn-entropy}
+knn_entropy_post <- compute_knn_entropy(seurat_obj, nn_name = "CyTOF_nn", meta_col = "center")
+seurat_obj$knn_entropy_post <- knn_entropy_post
+seurat_sub_post$knn_entropy_post <- seurat_obj$knn_entropy_post[umap_cells]
+
+cat("Post-Harmony per-cell KNN entropy:\n")
+cat("  Mean:", round(mean(knn_entropy_post), 4), "\n")
+cat("  Median:", round(median(knn_entropy_post), 4), "\n")
+cat("  SD:", round(sd(knn_entropy_post), 4), "\n")
+```
+
+```{r post-entropy-umap, fig.width=8, fig.height=6}
+umap_post_coords <- Embeddings(seurat_sub_post, "umap_post")
+entropy_df_post <- data.frame(UMAP_1 = umap_post_coords[, 1], UMAP_2 = umap_post_coords[, 2],
+                               knn_entropy = seurat_sub_post$knn_entropy_post)
+p_post_entropy_umap <- ggplot(entropy_df_post, aes(x = UMAP_1, y = UMAP_2, color = knn_entropy)) +
+  geom_point(size = 0.3) +
+  scale_color_viridis_c(limits = c(0, max_entropy), option = "inferno") +
+  theme_minimal() + ggtitle("Post-Harmony: KNN Neighborhood Entropy") + labs(color = "Entropy")
+p_post_entropy_umap
+```
+
+## Post-Harmony: Per-Cluster Entropy
+
+```{r post-cluster-entropy}
+cluster_center_table_post <- table(seurat_obj$clusters_post, seurat_obj$center)
+cluster_entropies_post <- apply(cluster_center_table_post, 1, shannon_entropy)
+cat("Mean cluster entropy:", round(mean(cluster_entropies_post), 3), "/", round(max_entropy, 3), "\n")
+```
+
+# 8. Comparison Plots
+
+## KNN Entropy UMAP: Side by Side
+
+```{r entropy-umap-comparison, fig.width=14, fig.height=6}
+p_pre_entropy_umap + ggtitle("Pre-Harmony: KNN Entropy") | p_post_entropy_umap + ggtitle("Post-Harmony: KNN Entropy")
+```
+
+## KNN Entropy Distribution (Histogram)
+
+```{r entropy-histogram, fig.width=10, fig.height=5}
+entropy_hist_df <- data.frame(
+  entropy = c(knn_entropy_pre, knn_entropy_post),
+  stage = rep(c("Pre-Harmony", "Post-Harmony"), each = length(knn_entropy_pre))
+)
+entropy_hist_df$stage <- factor(entropy_hist_df$stage, levels = c("Pre-Harmony", "Post-Harmony"))
+
+ggplot(entropy_hist_df, aes(x = entropy, fill = stage)) +
+  geom_histogram(alpha = 0.6, position = "identity", bins = 50) +
+  scale_fill_manual(values = c("Pre-Harmony" = "#E74C3C", "Post-Harmony" = "#2ECC71")) +
+  geom_vline(xintercept = max_entropy, linetype = "dashed", color = "black") +
+  annotate("text", x = max_entropy - 0.15, y = Inf, label = "Max entropy", vjust = 2, size = 3) +
+  theme_minimal() +
+  ggtitle("Per-Cell KNN Neighborhood Entropy Distribution") +
+  xlab("Shannon Entropy") + ylab("Count") + labs(fill = "Stage")
+```
+
+## Mean KNN Entropy (Bar Plot with Error Bars)
+
+```{r entropy-barplot, fig.width=5, fig.height=5}
+entropy_summary <- data.frame(
+  stage = factor(c("Pre-Harmony", "Post-Harmony"), levels = c("Pre-Harmony", "Post-Harmony")),
+  mean = c(mean(knn_entropy_pre), mean(knn_entropy_post)),
+  sd = c(sd(knn_entropy_pre), sd(knn_entropy_post))
+)
+
+ggplot(entropy_summary, aes(x = stage, y = mean, fill = stage)) +
+  geom_col(width = 0.6, alpha = 0.8) +
+  geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.2) +
+  geom_hline(yintercept = max_entropy, linetype = "dashed", color = "black") +
+  annotate("text", x = 2.4, y = max_entropy + 0.03, label = paste0("Max = ", round(max_entropy, 2)), size = 3) +
+  scale_fill_manual(values = c("Pre-Harmony" = "#E74C3C", "Post-Harmony" = "#2ECC71")) +
+  theme_minimal() + ggtitle("Mean Per-Cell KNN Entropy") +
+  xlab("") + ylab("Shannon Entropy (mean +/- SD)") +
+  theme(legend.position = "none") + ylim(0, max_entropy + 0.3)
+```
+
+## Per-Cluster Center Entropy (Pre vs Post)
+
+```{r cluster-entropy-barplot, fig.width=12, fig.height=5}
+cluster_ent_df <- data.frame(
+  cluster = c(names(cluster_entropies_pre), names(cluster_entropies_post)),
+  entropy = c(cluster_entropies_pre, cluster_entropies_post),
+  stage = c(rep("Pre-Harmony", length(cluster_entropies_pre)),
+            rep("Post-Harmony", length(cluster_entropies_post)))
+)
+cluster_ent_df$stage <- factor(cluster_ent_df$stage, levels = c("Pre-Harmony", "Post-Harmony"))
+cluster_ent_df$cluster <- factor(cluster_ent_df$cluster,
+                                  levels = sort(unique(as.numeric(as.character(cluster_ent_df$cluster)))))
+
+ggplot(cluster_ent_df, aes(x = cluster, y = entropy, fill = stage)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7, alpha = 0.8) +
+  geom_hline(yintercept = max_entropy, linetype = "dashed", color = "black") +
+  annotate("text", x = Inf, y = max_entropy + 0.05, label = paste0("Max = ", round(max_entropy, 2)),
+           hjust = 1.1, size = 3) +
+  scale_fill_manual(values = c("Pre-Harmony" = "#E74C3C", "Post-Harmony" = "#2ECC71")) +
+  theme_minimal() + ggtitle("Per-Cluster Center Entropy: Pre vs Post Harmony") +
+  xlab("Cluster") + ylab("Shannon Entropy") + labs(fill = "Stage") +
+  theme(axis.text.x = element_text(size = 7))
+```
+
+## Full Comparison Panel
+
+```{r full-comparison, fig.width=14, fig.height=16}
+(p_pre_center + ggtitle("PRE: Center") | p_post_center + ggtitle("POST: Center")) /
+(p_pre_entropy_umap + ggtitle("PRE: KNN Entropy") | p_post_entropy_umap + ggtitle("POST: KNN Entropy")) /
+(p_pre_cluster + ggtitle("PRE: Cluster") | p_post_cluster + ggtitle("POST: Cluster"))
+```
+
+# 9. Summary
+
+```{r summary}
+cat("========================================\n")
+cat("BATCH EFFECT COMPARISON\n")
+cat("========================================\n")
+cat("Max possible entropy (6 centers):", round(max_entropy, 4), "\n\n")
+cat("--- Per-Cell KNN Entropy ---\n")
+cat("Pre-Harmony  mean:", round(mean(knn_entropy_pre), 4), " SD:", round(sd(knn_entropy_pre), 4), "\n")
+cat("Post-Harmony mean:", round(mean(knn_entropy_post), 4), " SD:", round(sd(knn_entropy_post), 4), "\n\n")
+cat("--- Per-Cluster Entropy ---\n")
+cat("Pre-Harmony  mean:", round(mean(cluster_entropies_pre), 4), "\n")
+cat("Post-Harmony mean:", round(mean(cluster_entropies_post), 4), "\n")
+```
+
+```{r session-info}
+sessionInfo()
+```
