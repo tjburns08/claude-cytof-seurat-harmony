@@ -12,7 +12,7 @@ Can we detect and correct batch effects in mass cytometry (CyTOF) data using Seu
 
 ## Data
 
-The analysis uses 36 FCS files from a multi-center CyTOF study (6 centers, 3 conditions, 2 replicates per condition per center). The dataset comes from Leipold et al, J. Immunol. Methods 2018, the full text of which can be found [here](https://pmc.ncbi.nlm.nih.gov/articles/PMC5805584/) To reproduce:
+The analysis uses 36 FCS files from a multi-center CyTOF study (6 centers, 3 conditions per center, day 1 and day 2 per condition). We batch corrected only on the center. The dataset comes from Leipold et al, J. Immunol. Methods 2018, the full text of which can be found [here](https://pmc.ncbi.nlm.nih.gov/articles/PMC5805584/) To reproduce:
 
 1. Place FCS files (from the paper above) in a `data/` directory at the project root
 2. File names are expected in the format `Center_N_Condition_Replicate_....fcs`
